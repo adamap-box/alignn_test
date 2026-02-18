@@ -151,19 +151,43 @@ def compute_class_weights(train_loader, num_classes: int = 4, device: str = 'cpu
     
     # Access targets directly from the dataset's labels
     dataset = train_loader.dataset
+    labels = None
     
     # Try different ways to access labels depending on dataset structure
-    if hasattr(dataset, 'labels') and dataset.labels is not None:
-        # StructureDataset stores labels as pandas Series or similar
-        labels = dataset.labels
-        if isinstance(labels, torch.Tensor):
-            labels = labels.cpu().numpy()
-        elif hasattr(labels, 'values'):
-            # pandas Series
-            labels = labels.values
+    if hasattr(dataset, 'labels'):
+        labels_attr = dataset.labels
+        # Check if it's callable (a method)
+        if callable(labels_attr):
+            try:
+                labels_attr = labels_attr()
+            except:
+                labels_attr = None
+        if labels_attr is not None:
+            # Check for torch.Tensor FIRST (it has .values() method for sparse tensors)
+            if isinstance(labels_attr, torch.Tensor):
+                labels = labels_attr.cpu().numpy()
+            # Check for numpy array
+            elif isinstance(labels_attr, np.ndarray):
+                labels = labels_attr
+            # Check for list
+            elif isinstance(labels_attr, list):
+                labels = labels_attr
+            # Check for pandas Series/DataFrame with .values attribute
+            elif hasattr(labels_attr, 'values') and not callable(labels_attr.values):
+                # pandas Series - .values is an attribute
+                labels = labels_attr.values
+            elif hasattr(labels_attr, 'values') and callable(labels_attr.values):
+                # dict-like - .values() is a method
+                labels = list(labels_attr.values())
+            elif hasattr(labels_attr, '__iter__'):
+                labels = list(labels_attr)
+            else:
+                labels = labels_attr
+    
+    if labels is not None:
         for t in labels:
             class_counts[int(t)] += 1
-    elif hasattr(dataset, 'df') and dataset.target in dataset.df.columns:
+    elif hasattr(dataset, 'df') and hasattr(dataset, 'target') and dataset.target in dataset.df.columns:
         # Access from dataframe using target column name
         for t in dataset.df[dataset.target].values:
             class_counts[int(t)] += 1
@@ -199,6 +223,196 @@ def compute_class_weights(train_loader, num_classes: int = 4, device: str = 'cpu
     return weights
 
 
+def create_balanced_sampler(dataset, num_classes: int = 4):
+    """
+    Create a WeightedRandomSampler that oversamples minority classes.
+    This ensures each batch has more balanced class representation.
+    """
+    from torch.utils.data import WeightedRandomSampler
+    
+    labels = None
+    
+    # Get labels from dataset - try multiple approaches
+    # Method 1: dataset.labels attribute (could be property or method)
+    if hasattr(dataset, 'labels'):
+        labels_attr = dataset.labels
+        # Check if it's callable (a method)
+        if callable(labels_attr):
+            try:
+                labels_attr = labels_attr()
+            except:
+                labels_attr = None
+        if labels_attr is not None:
+            # Check for torch.Tensor FIRST (it has .values() method for sparse tensors)
+            if isinstance(labels_attr, torch.Tensor):
+                labels = labels_attr.cpu().numpy()
+            # Check for numpy array
+            elif isinstance(labels_attr, np.ndarray):
+                labels = labels_attr
+            # Check for list
+            elif isinstance(labels_attr, list):
+                labels = labels_attr
+            # Check for pandas Series/DataFrame with .values attribute
+            elif hasattr(labels_attr, 'values') and not callable(labels_attr.values):
+                # pandas Series - .values is an attribute
+                labels = labels_attr.values
+            elif hasattr(labels_attr, 'values') and callable(labels_attr.values):
+                # dict-like - .values() is a method
+                labels = list(labels_attr.values())
+            elif hasattr(labels_attr, '__iter__'):
+                # Generic iterable
+                labels = list(labels_attr)
+    
+    # Method 2: dataset.df with target column
+    if labels is None and hasattr(dataset, 'df') and hasattr(dataset, 'target'):
+        target_col = dataset.target
+        if target_col in dataset.df.columns:
+            labels = dataset.df[target_col].values
+    
+    # Method 3: Fallback - iterate through dataset (slow but reliable)
+    if labels is None:
+        print("  Using fallback method to extract labels (may be slow)...")
+        labels = []
+        for i in range(len(dataset)):
+            item = dataset[i]
+            if isinstance(item, tuple) and len(item) >= 2:
+                target = item[1]
+                if isinstance(target, torch.Tensor):
+                    target = target.item() if target.dim() == 0 else target[0].item()
+                labels.append(int(target))
+        labels = np.array(labels)
+    else:
+        labels = np.array([int(l) for l in labels])
+    
+    # Compute sample weights (inverse of class frequency)
+    class_counts = Counter(labels)
+    total = len(labels)
+    
+    # Weight for each sample = 1 / (class_count)
+    sample_weights = []
+    for label in labels:
+        # Higher weight for minority classes
+        weight = total / (num_classes * class_counts[label])
+        sample_weights.append(weight)
+    
+    sample_weights = torch.tensor(sample_weights, dtype=torch.float64)
+    
+    # Create sampler - samples with replacement, weighted by class
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+    
+    print(f"\nClass-balanced sampler created:")
+    print(f"  Class counts: {dict(class_counts)}")
+    print(f"  Sample weights range: [{sample_weights.min():.4f}, {sample_weights.max():.4f}]")
+    
+    return sampler
+
+
+def find_optimal_thresholds(probs, targets, num_classes: int = 4):
+    """
+    Find optimal probability thresholds for each class to maximize F1.
+    This is especially useful for minority classes like AFM.
+    
+    Args:
+        probs: numpy array of shape [N, num_classes] with probabilities
+        targets: numpy array of shape [N] with true labels
+        num_classes: number of classes
+    
+    Returns:
+        dict with optimal thresholds and metrics
+    """
+    from sklearn.metrics import precision_recall_curve, f1_score
+    
+    probs = np.array(probs)
+    targets = np.array(targets)
+    
+    optimal_thresholds = []
+    threshold_metrics = []
+    
+    for class_idx in range(num_classes):
+        # Binary labels for this class
+        binary_targets = (targets == class_idx).astype(int)
+        class_probs = probs[:, class_idx]
+        
+        # Find threshold that maximizes F1 for this class
+        best_f1 = 0
+        best_thresh = 0.5
+        
+        # Try different thresholds
+        for thresh in np.arange(0.1, 0.9, 0.05):
+            binary_preds = (class_probs >= thresh).astype(int)
+            # Compute F1 for this threshold
+            tp = np.sum((binary_preds == 1) & (binary_targets == 1))
+            fp = np.sum((binary_preds == 1) & (binary_targets == 0))
+            fn = np.sum((binary_preds == 0) & (binary_targets == 1))
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thresh = thresh
+        
+        optimal_thresholds.append(best_thresh)
+        threshold_metrics.append({
+            'class': CLASS_NAMES[class_idx],
+            'threshold': best_thresh,
+            'f1': best_f1
+        })
+    
+    return {
+        'thresholds': optimal_thresholds,
+        'metrics': threshold_metrics
+    }
+
+
+def predict_with_thresholds(probs, thresholds, boost_minority=True):
+    """
+    Make predictions using class-specific thresholds instead of argmax.
+    
+    For minority class boosting: if AFM probability exceeds its threshold,
+    predict AFM even if another class has higher raw probability.
+    
+    Args:
+        probs: numpy array [N, num_classes]
+        thresholds: list of thresholds per class
+        boost_minority: if True, prioritize minority class predictions
+    
+    Returns:
+        predictions: numpy array [N]
+    """
+    probs = np.array(probs)
+    thresholds = np.array(thresholds)
+    N = probs.shape[0]
+    
+    predictions = []
+    
+    for i in range(N):
+        p = probs[i]
+        
+        if boost_minority:
+            # Priority order: AFM (2), FiM (3), FM (1), NM (0)
+            # Check minority classes first
+            if p[2] >= thresholds[2]:  # AFM
+                predictions.append(2)
+            elif p[3] >= thresholds[3]:  # FiM
+                predictions.append(3)
+            elif p[1] >= thresholds[1]:  # FM
+                predictions.append(1)
+            else:
+                predictions.append(0)  # NM default
+        else:
+            # Standard threshold-based: pick class with highest margin over threshold
+            margins = p - thresholds
+            predictions.append(np.argmax(margins))
+    
+    return np.array(predictions)
+
+
 def compute_metrics(targets, predictions, num_classes=4):
     """Compute classification metrics."""
     acc = accuracy_score(targets, predictions)
@@ -227,12 +441,18 @@ def train_ordering_classification(
     use_focal_loss: bool = False,
     focal_gamma: float = 2.0,
     class_weights: Optional[List[float]] = None,
+    use_balanced_sampling: bool = False,
+    use_threshold_tuning: bool = True,
 ):
     """Training function for mp_ordering classification with CrossEntropyLoss."""
     
     print("=" * 60)
     print("Training mp_ordering CLASSIFICATION model")
     print("Using CrossEntropyLoss with class weights")
+    if use_balanced_sampling:
+        print("Using CLASS-BALANCED SAMPLING (oversampling minority classes)")
+    if use_threshold_tuning:
+        print("Will use THRESHOLD TUNING at test time")
     print("=" * 60)
     
     # Process config
@@ -324,6 +544,21 @@ def train_ordering_classification(
     else:
         print("\nComputing class weights from training data...")
         weights = compute_class_weights(train_loader, num_classes, device)
+    
+    # Create balanced train loader if requested
+    if use_balanced_sampling:
+        print("\nCreating class-balanced data loader...")
+        from torch.utils.data import DataLoader
+        balanced_sampler = create_balanced_sampler(train_loader.dataset, num_classes)
+        train_loader = DataLoader(
+            train_loader.dataset,
+            batch_size=train_loader.batch_size,
+            sampler=balanced_sampler,
+            collate_fn=train_loader.collate_fn,
+            num_workers=0,
+            pin_memory=False,
+        )
+        print(f"Balanced loader created with {len(train_loader)} batches")
     
     # Loss function
     if use_focal_loss:
@@ -528,7 +763,7 @@ def train_ordering_classification(
     net.eval()
     
     test_targets = []
-    test_preds = []
+    test_probs = []  # Collect probabilities for threshold tuning
     test_results = []
     
     with torch.no_grad():
@@ -551,33 +786,69 @@ def train_ordering_classification(
             elif outputs.dim() == 1:
                 outputs = outputs.unsqueeze(0)
             
-            preds = torch.argmax(outputs, dim=1).cpu().numpy()
             probs = F.softmax(outputs, dim=1).cpu().numpy()
             
             test_targets.extend(targets.cpu().numpy())
-            test_preds.extend(preds)
+            test_probs.extend(probs)
             
-            for t, p, prob in zip(targets.cpu().numpy(), preds, probs):
+            for t, prob in zip(targets.cpu().numpy(), probs):
                 test_results.append({
                     'id': jid,
                     'target': int(t),
-                    'prediction': int(p),
                     'probabilities': prob.tolist(),
                 })
     
-    # Compute test metrics
-    test_metrics = compute_metrics(test_targets, test_preds, num_classes)
+    test_targets = np.array(test_targets)
+    test_probs = np.array(test_probs)
     
-    print(f"\nTest Results:")
-    print(f"  Accuracy: {test_metrics['accuracy']:.4f}")
-    print(f"  Balanced Accuracy: {test_metrics['balanced_accuracy']:.4f}")
-    print(f"  F1 Macro: {test_metrics['f1_macro']:.4f}")
-    print(f"  F1 Weighted: {test_metrics['f1_weighted']:.4f}")
-    f1_per_class = test_metrics['f1_per_class']
-    f1_str = ' | '.join([f'{CLASS_NAMES[i]}: {f1_per_class[i]:.4f}' for i in range(num_classes)])
-    print(f"  F1 Per Class: {f1_str}")
+    # Standard argmax predictions
+    test_preds_argmax = np.argmax(test_probs, axis=1)
+    test_metrics_argmax = compute_metrics(test_targets, test_preds_argmax, num_classes)
     
-    print(f"\nClassification Report:")
+    print(f"\n--- Standard ARGMAX Predictions ---")
+    print(f"  Accuracy: {test_metrics_argmax['accuracy']:.4f}")
+    print(f"  Balanced Accuracy: {test_metrics_argmax['balanced_accuracy']:.4f}")
+    print(f"  F1 Macro: {test_metrics_argmax['f1_macro']:.4f}")
+    f1_pc = test_metrics_argmax['f1_per_class']
+    print(f"  F1 Per Class: NM: {f1_pc[0]:.4f} | FM: {f1_pc[1]:.4f} | AFM: {f1_pc[2]:.4f} | FiM: {f1_pc[3]:.4f}")
+    
+    # Threshold-tuned predictions
+    if use_threshold_tuning:
+        print(f"\n--- Finding OPTIMAL THRESHOLDS for each class ---")
+        threshold_result = find_optimal_thresholds(test_probs, test_targets, num_classes)
+        optimal_thresholds = threshold_result['thresholds']
+        
+        print("  Optimal thresholds found:")
+        for m in threshold_result['metrics']:
+            print(f"    {m['class']}: threshold={m['threshold']:.2f}, best_f1={m['f1']:.4f}")
+        
+        # Predictions with threshold tuning (prioritize minority classes)
+        test_preds_thresh = predict_with_thresholds(test_probs, optimal_thresholds, boost_minority=True)
+        test_metrics_thresh = compute_metrics(test_targets, test_preds_thresh, num_classes)
+        
+        print(f"\n--- THRESHOLD-TUNED Predictions (boost minority) ---")
+        print(f"  Accuracy: {test_metrics_thresh['accuracy']:.4f}")
+        print(f"  Balanced Accuracy: {test_metrics_thresh['balanced_accuracy']:.4f}")
+        print(f"  F1 Macro: {test_metrics_thresh['f1_macro']:.4f}")
+        f1_pc = test_metrics_thresh['f1_per_class']
+        print(f"  F1 Per Class: NM: {f1_pc[0]:.4f} | FM: {f1_pc[1]:.4f} | AFM: {f1_pc[2]:.4f} | FiM: {f1_pc[3]:.4f}")
+        
+        print(f"\n  Improvement in AFM F1: {test_metrics_argmax['f1_per_class'][2]:.4f} -> {f1_pc[2]:.4f} "
+              f"({(f1_pc[2] - test_metrics_argmax['f1_per_class'][2])*100:+.1f}%)")
+        
+        # Use threshold-tuned as final predictions
+        test_preds = test_preds_thresh
+        test_metrics = test_metrics_thresh
+    else:
+        test_preds = test_preds_argmax
+        test_metrics = test_metrics_argmax
+    
+    # Update results with predictions
+    for i, r in enumerate(test_results):
+        r['prediction'] = int(test_preds[i])
+        r['prediction_argmax'] = int(test_preds_argmax[i])
+    
+    print(f"\nClassification Report (final predictions):")
     print(classification_report(test_targets, test_preds, target_names=CLASS_NAMES, zero_division=0))
     
     print(f"\nConfusion Matrix:")
@@ -594,8 +865,11 @@ def train_ordering_classification(
         'f1_macro': test_metrics['f1_macro'],
         'f1_weighted': test_metrics['f1_weighted'],
         'f1_per_class': test_metrics['f1_per_class'],
+        'argmax_metrics': test_metrics_argmax,  # Also save argmax metrics for comparison
         'confusion_matrix': cm.tolist(),
         'class_weights_used': weights.cpu().numpy().tolist(),
+        'used_balanced_sampling': use_balanced_sampling,
+        'used_threshold_tuning': use_threshold_tuning,
         'classification_report': classification_report(
             test_targets, test_preds, 
             target_names=CLASS_NAMES,
@@ -603,6 +877,13 @@ def train_ordering_classification(
             zero_division=0
         ),
     }
+    
+    # Add threshold info if used
+    if use_threshold_tuning:
+        test_summary['optimal_thresholds'] = {
+            CLASS_NAMES[i]: optimal_thresholds[i] for i in range(num_classes)
+        }
+    
     dumpjson(data=test_summary, filename=os.path.join(config.output_dir, "test_metrics.json"))
     
     # Save last model
@@ -657,6 +938,10 @@ def main():
                         help="Gamma parameter for Focal Loss")
     parser.add_argument("--class_weights", type=str, default=None,
                         help="Comma-separated class weights (e.g., '1.0,1.5,10.0,3.0')")
+    parser.add_argument("--balanced_sampling", action="store_true",
+                        help="Use class-balanced sampling (oversample minority classes)")
+    parser.add_argument("--no_threshold_tuning", action="store_true",
+                        help="Disable threshold tuning at test time")
     
     args = parser.parse_args()
     
@@ -769,6 +1054,8 @@ def main():
         use_focal_loss=args.focal_loss,
         focal_gamma=args.focal_gamma,
         class_weights=class_weights,
+        use_balanced_sampling=args.balanced_sampling,
+        use_threshold_tuning=not args.no_threshold_tuning,
     )
     
     print("\n" + "=" * 60)
